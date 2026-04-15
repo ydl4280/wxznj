@@ -3,9 +3,4 @@ opencv-python-headless==4.8.1.78
 paddleocr==2.7.0.3
 paddlepaddle==2.6.2
 numpy==1.24.3
-pillow==10.0.0flask==2.3.3
-opencv-python-headless==4.8.1.78
-paddleocr==2.7.0.3
-paddlepaddle==2.5.2
-numpy==1.24.3
 pillow==10.0.0
