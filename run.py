@@ -228,8 +228,7 @@ def health():
     return jsonify({"ok": True})
 
 
-@app.route("/api/count", methods=["POST"])
-def api_count():
+def handle_count_request():
     started = time.time()
     debug_id = f"req_{uuid.uuid4().hex[:12]}"
 
@@ -308,6 +307,36 @@ def api_count():
         )
     except Exception as exc:
         return make_error(debug_id, f"ocr failed: {exc}", 500)
+
+
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify(
+        {
+            "ok": True,
+            "service": "cloud_ocr_service",
+            "routes": [
+                "/api/count",
+                "/count",
+                "/api/parse-grid",
+                "/api/parse_grid",
+                "/api/grid/parse",
+                "/api/ocr/grid",
+            ],
+        }
+    )
+
+
+@app.route("/api/count", methods=["POST"])
+@app.route("/api/count/", methods=["POST"])
+@app.route("/count", methods=["POST"])
+@app.route("/count/", methods=["POST"])
+@app.route("/api/parse-grid", methods=["POST"])
+@app.route("/api/parse_grid", methods=["POST"])
+@app.route("/api/grid/parse", methods=["POST"])
+@app.route("/api/ocr/grid", methods=["POST"])
+def api_count():
+    return handle_count_request()
 
 
 if __name__ == "__main__":
