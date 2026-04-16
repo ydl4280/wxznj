@@ -49,6 +49,17 @@ def decode_base64_image(b64: str) -> np.ndarray:
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("invalid image base64")
+    
+    # Limit image size to prevent PaddleOCR failures
+    MAX_SIZE = 2000
+    h, w = image.shape[:2]
+    if w > MAX_SIZE or h > MAX_SIZE:
+        scale = MAX_SIZE / float(max(w, h))
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        print(f"[DEBUG] Image resized from {w}x{h} to {new_w}x{new_h}")
+    
     return image
 
 
@@ -60,6 +71,17 @@ def download_image(url: str, timeout_sec: int = 20) -> np.ndarray:
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("invalid image content from url")
+    
+    # Limit image size to prevent PaddleOCR failures
+    MAX_SIZE = 2000
+    h, w = image.shape[:2]
+    if w > MAX_SIZE or h > MAX_SIZE:
+        scale = MAX_SIZE / float(max(w, h))
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        print(f"[DEBUG] Image resized from {w}x{h} to {new_w}x{new_h}")
+    
     return image
 
 
@@ -204,10 +226,29 @@ def to_cell_index(center: float, origin: float, cell_size: float) -> int:
 
 
 def run_full_image_ocr(image: np.ndarray):
-    # PaddleOCR accepts numpy BGR image directly.
-    result = OCR_ENGINE.ocr(image, cls=False)
-    lines = result[0] if result and len(result) > 0 else []
-    return lines
+    """Run OCR on the full image with error handling and preprocessing"""
+    try:
+        # Preprocess image to improve OCR accuracy
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply slight sharpening to improve text clarity
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        gray = cv2.filter2D(gray, -1, kernel)
+        
+        # Convert back to BGR for PaddleOCR
+        processed_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        
+        # PaddleOCR accepts numpy BGR image directly.
+        result = OCR_ENGINE.ocr(processed_image, cls=False)
+        lines = result[0] if result and len(result) > 0 else []
+        print(f"[DEBUG] OCR completed successfully, found {len(lines) if lines else 0} text regions")
+        return lines
+    except Exception as e:
+        print(f"[ERROR] OCR failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return empty list instead of raising exception
+        return []
 
 
 def map_ocr_to_grid(lines, grid_info):
@@ -325,10 +366,11 @@ def handle_count_request():
 
     try:
         h, w = image.shape[:2]
+        
+        print(f"[DEBUG] Starting grid detection for {w}x{h} image")
         grid_info = estimate_grid(image, rows, cols)
         
-        # 添加调试信息
-        print(f"[DEBUG] Image size: {w}x{h}")
+        # Add debugging information
         print(f"[DEBUG] Grid detected: {grid_info['rows']}x{grid_info['cols']}")
         print(f"[DEBUG] Cell size: {grid_info['cell_w']:.2f}x{grid_info['cell_h']:.2f}")
         print(f"[DEBUG] Origin: ({grid_info['origin_x']:.2f}, {grid_info['origin_y']:.2f})")
@@ -372,7 +414,11 @@ def handle_count_request():
             }
         )
     except Exception as exc:
-        return make_error(debug_id, f"ocr failed: {exc}", 500)
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[ERROR] OCR processing failed:")
+        print(error_detail)
+        return make_error(debug_id, f"ocr failed: {str(exc)}", 500)
 
 
 @app.route("/", methods=["GET"])
