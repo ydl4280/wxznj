@@ -24,7 +24,10 @@ OCR_ENGINE = PaddleOCR(
 )
 
 ALNUM_PATTERN = re.compile(r"[A-Z0-9]+")
-MARD_PATTERN = re.compile(r"^[A-Z]{1,2}[0-9]{1,3}$")
+# 更宽松的色号匹配模式：支持 A1, AB12, A1B, ABC123 等格式
+MARD_PATTERN = re.compile(r"^[A-Z]{1,3}[0-9]{1,4}[A-Z]?$", re.IGNORECASE)
+# 备选模式：纯字母+数字组合
+COLOR_CODE_PATTERN = re.compile(r"^[A-Z]{1,4}[0-9]{1,4}$", re.IGNORECASE)
 
 
 def make_error(debug_id: str, message: str, status_code: int = 400):
@@ -106,21 +109,56 @@ def estimate_axis(
     profile: np.ndarray,
     expected_count: Optional[int],
 ) -> Tuple[float, float, int]:
+    """
+    估算轴向上的网格参数
+    :param axis_len: 轴长度（宽或高）
+    :param profile: 边缘强度分布
+    :param expected_count: 期望的网格数（如果提供则直接使用）
+    :return: (origin, spacing, count)
+    """
     if expected_count and expected_count > 0:
+        # 如果提供了期望值，直接计算
         spacing = axis_len / float(expected_count)
         return 0.0, spacing, int(expected_count)
 
-    smoothed = smooth_profile(profile, 9)
-    threshold = float(np.mean(smoothed) + np.std(smoothed) * 0.9)
+    # 自动检测模式：使用边缘检测和峰值分析
+    smoothed = smooth_profile(profile, window=15)  # 增加平滑窗口，减少噪声
+    
+    # 使用更激进的阈值，只保留强边缘
+    mean_val = float(np.mean(smoothed))
+    std_val = float(np.std(smoothed))
+    threshold = mean_val + std_val * 1.5  # 提高阈值，减少误检测
+    
     peaks = collect_peaks(smoothed, threshold)
-    spacing = estimate_spacing_from_peaks(peaks)
-
-    if not spacing or spacing <= 2:
-        # Fallback: default around 52-grid if no reliable peaks.
-        spacing = max(8.0, axis_len / 52.0)
-
+    
+    # 尝试不同的间距范围，找到最合理的网格间距
+    spacing_candidates = []
+    for min_gap in [8, 12, 16, 20]:
+        for max_gap in [100, 150, 200]:
+            s = estimate_spacing_from_peaks(peaks, min_gap=min_gap, max_gap=max_gap)
+            if s and s > 5:  # 最小单元格尺寸至少5像素
+                spacing_candidates.append(s)
+    
+    if spacing_candidates:
+        # 使用中位数作为最终间距，避免异常值
+        spacing = float(np.median(spacing_candidates))
+    else:
+        # Fallback: 默认假设是中等大小的网格（30-80格）
+        spacing = max(10.0, axis_len / 50.0)
+    
     origin = estimate_origin_from_peaks(peaks, spacing)
     count = max(1, int(round((axis_len - origin) / spacing)))
+    
+    # 限制网格数在合理范围内（避免过细或过粗）
+    if count > 200:
+        # 网格太多，可能是检测到了纹理而非真正的网格线
+        count = min(count, 150)
+        spacing = axis_len / float(count)
+    elif count < 10:
+        # 网格太少，可能漏检
+        count = max(count, 20)
+        spacing = axis_len / float(count)
+    
     return origin, spacing, count
 
 
@@ -192,11 +230,26 @@ def map_ocr_to_grid(lines, grid_info):
 
         text_raw = str(text_info[0] or "")
         conf = float(text_info[1] or 0.0)
+        
+        # 降低置信度阈值，保留更多候选
+        if conf < 0.3:
+            continue
+        
         text = normalize_text(text_raw)
         if not text:
             continue
-        if not MARD_PATTERN.match(text):
-            # Keep only likely color-code style tokens.
+        
+        # 使用更宽松的匹配策略
+        is_valid_code = False
+        if MARD_PATTERN.match(text):
+            is_valid_code = True
+        elif COLOR_CODE_PATTERN.match(text):
+            is_valid_code = True
+        elif len(text) >= 2 and any(c.isalpha() for c in text) and any(c.isdigit() for c in text):
+            # 至少包含字母和数字的组合
+            is_valid_code = True
+        
+        if not is_valid_code:
             continue
 
         pts = np.array(box, dtype=np.float32)
@@ -210,6 +263,7 @@ def map_ocr_to_grid(lines, grid_info):
 
         key = (row, col)
         prev = cells.get(key)
+        # 选择置信度更高的结果
         if prev is None or conf > prev["conf"]:
             cells[key] = {
                 "row": row + 1,
@@ -272,8 +326,20 @@ def handle_count_request():
     try:
         h, w = image.shape[:2]
         grid_info = estimate_grid(image, rows, cols)
+        
+        # 添加调试信息
+        print(f"[DEBUG] Image size: {w}x{h}")
+        print(f"[DEBUG] Grid detected: {grid_info['rows']}x{grid_info['cols']}")
+        print(f"[DEBUG] Cell size: {grid_info['cell_w']:.2f}x{grid_info['cell_h']:.2f}")
+        print(f"[DEBUG] Origin: ({grid_info['origin_x']:.2f}, {grid_info['origin_y']:.2f})")
+        if rows or cols:
+            print(f"[DEBUG] User provided: rows={rows}, cols={cols}")
+        
         ocr_lines = run_full_image_ocr(image)
+        print(f"[DEBUG] OCR detected {len(ocr_lines) if ocr_lines else 0} text regions")
+        
         mapped_cells = map_ocr_to_grid(ocr_lines, grid_info)
+        print(f"[DEBUG] Mapped {len(mapped_cells)} cells with valid color codes")
 
         elapsed_ms = int((time.time() - started) * 1000)
         return jsonify(
