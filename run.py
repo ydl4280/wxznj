@@ -1,5 +1,5 @@
 import base64
-import io
+import json
 import os
 import re
 import time
@@ -10,24 +10,12 @@ import cv2
 import numpy as np
 import requests
 from flask import Flask, jsonify, request
-from paddleocr import PaddleOCR
 
 
 app = Flask(__name__)
 
-# Global OCR object for warm reuse (avoid reloading model every request).
-OCR_ENGINE = PaddleOCR(
-    use_angle_cls=False,
-    lang="en",
-    show_log=False,
-    use_gpu=False,
-)
-
-ALNUM_PATTERN = re.compile(r"[A-Z0-9]+")
-# 更宽松的色号匹配模式：支持 A1, AB12, A1B, ABC123 等格式
-MARD_PATTERN = re.compile(r"^[A-Z]{1,3}[0-9]{1,4}[A-Z]?$", re.IGNORECASE)
-# 备选模式：纯字母+数字组合
-COLOR_CODE_PATTERN = re.compile(r"^[A-Z]{1,4}[0-9]{1,4}$", re.IGNORECASE)
+MAX_IMAGE_EDGE = 2200
+HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
 
 def make_error(debug_id: str, message: str, status_code: int = 400):
@@ -40,8 +28,39 @@ def make_error(debug_id: str, message: str, status_code: int = 400):
     ), status_code
 
 
+def parse_positive_int(value) -> Optional[int]:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def parse_bool(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def resize_if_needed(image: np.ndarray, max_edge: int = MAX_IMAGE_EDGE) -> np.ndarray:
+    h, w = image.shape[:2]
+    if max(h, w) <= max_edge:
+        return image
+    scale = float(max_edge) / float(max(h, w))
+    target_w = max(1, int(round(w * scale)))
+    target_h = max(1, int(round(h * scale)))
+    return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+
 def decode_base64_image(b64: str) -> np.ndarray:
-    raw = b64.strip()
+    raw = str(b64 or "").strip()
     if raw.startswith("data:image"):
         raw = raw.split(",", 1)[-1]
     image_bytes = base64.b64decode(raw)
@@ -49,18 +68,7 @@ def decode_base64_image(b64: str) -> np.ndarray:
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("invalid image base64")
-    
-    # Limit image size to prevent PaddleOCR failures
-    MAX_SIZE = 2000
-    h, w = image.shape[:2]
-    if w > MAX_SIZE or h > MAX_SIZE:
-        scale = MAX_SIZE / float(max(w, h))
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        print(f"[DEBUG] Image resized from {w}x{h} to {new_w}x{new_h}")
-    
-    return image
+    return resize_if_needed(image)
 
 
 def download_image(url: str, timeout_sec: int = 20) -> np.ndarray:
@@ -71,251 +79,523 @@ def download_image(url: str, timeout_sec: int = 20) -> np.ndarray:
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("invalid image content from url")
-    
-    # Limit image size to prevent PaddleOCR failures
-    MAX_SIZE = 2000
-    h, w = image.shape[:2]
-    if w > MAX_SIZE or h > MAX_SIZE:
-        scale = MAX_SIZE / float(max(w, h))
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        print(f"[DEBUG] Image resized from {w}x{h} to {new_w}x{new_h}")
-    
-    return image
+    return resize_if_needed(image)
 
 
-def smooth_profile(profile: np.ndarray, window: int = 9) -> np.ndarray:
-    if window <= 1:
-        return profile
-    kernel = np.ones(window, dtype=np.float32) / float(window)
-    return np.convolve(profile, kernel, mode="same")
-
-
-def collect_peaks(profile: np.ndarray, threshold: float) -> List[int]:
-    peaks: List[int] = []
-    for i in range(1, len(profile) - 1):
-        if profile[i] >= threshold and profile[i] >= profile[i - 1] and profile[i] >= profile[i + 1]:
-            peaks.append(i)
-    return peaks
-
-
-def estimate_spacing_from_peaks(peaks: List[int], min_gap: int = 4, max_gap: int = 200) -> Optional[float]:
-    if len(peaks) < 2:
+def hex_to_rgb(hex_color: str) -> Optional[Tuple[int, int, int]]:
+    text = str(hex_color or "").strip()
+    if not HEX_COLOR_RE.match(text):
         return None
-    gaps = []
-    for i in range(1, len(peaks)):
-        gap = peaks[i] - peaks[i - 1]
-        if min_gap <= gap <= max_gap:
-            gaps.append(gap)
-    if not gaps:
-        return None
-    return float(np.median(gaps))
+    if not text.startswith("#"):
+        text = f"#{text}"
+    return (int(text[1:3], 16), int(text[3:5], 16), int(text[5:7], 16))
 
 
-def estimate_origin_from_peaks(peaks: List[int], spacing: float) -> float:
-    if not peaks or spacing <= 0:
-        return 0.0
-    mods = [int(round(p % spacing)) for p in peaks]
-    if not mods:
-        return 0.0
-    hist: Dict[int, int] = {}
-    for m in mods:
-        hist[m] = hist.get(m, 0) + 1
-    origin_mod = max(hist.items(), key=lambda x: x[1])[0]
-    return float(origin_mod)
+def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+    r, g, b = [int(max(0, min(255, c))) for c in rgb]
+    return f"#{r:02X}{g:02X}{b:02X}"
 
 
-def estimate_axis(
-    axis_len: int,
-    profile: np.ndarray,
-    expected_count: Optional[int],
-) -> Tuple[float, float, int]:
-    """
-    估算轴向上的网格参数
-    :param axis_len: 轴长度（宽或高）
-    :param profile: 边缘强度分布
-    :param expected_count: 期望的网格数（如果提供则直接使用）
-    :return: (origin, spacing, count)
-    """
-    if expected_count and expected_count > 0:
-        # 如果提供了期望值，直接计算
-        spacing = axis_len / float(expected_count)
-        return 0.0, spacing, int(expected_count)
-
-    # 自动检测模式：使用边缘检测和峰值分析
-    smoothed = smooth_profile(profile, window=15)  # 增加平滑窗口，减少噪声
-    
-    # 使用更激进的阈值，只保留强边缘
-    mean_val = float(np.mean(smoothed))
-    std_val = float(np.std(smoothed))
-    threshold = mean_val + std_val * 1.5  # 提高阈值，减少误检测
-    
-    peaks = collect_peaks(smoothed, threshold)
-    
-    # 尝试不同的间距范围，找到最合理的网格间距
-    spacing_candidates = []
-    for min_gap in [8, 12, 16, 20]:
-        for max_gap in [100, 150, 200]:
-            s = estimate_spacing_from_peaks(peaks, min_gap=min_gap, max_gap=max_gap)
-            if s and s > 5:  # 最小单元格尺寸至少5像素
-                spacing_candidates.append(s)
-    
-    if spacing_candidates:
-        # 使用中位数作为最终间距，避免异常值
-        spacing = float(np.median(spacing_candidates))
-    else:
-        # Fallback: 默认假设是中等大小的网格（30-80格）
-        spacing = max(10.0, axis_len / 50.0)
-    
-    origin = estimate_origin_from_peaks(peaks, spacing)
-    count = max(1, int(round((axis_len - origin) / spacing)))
-    
-    # 限制网格数在合理范围内（避免过细或过粗）
-    if count > 200:
-        # 网格太多，可能是检测到了纹理而非真正的网格线
-        count = min(count, 150)
-        spacing = axis_len / float(count)
-    elif count < 10:
-        # 网格太少，可能漏检
-        count = max(count, 20)
-        spacing = axis_len / float(count)
-    
-    return origin, spacing, count
+def rgb_to_lab(rgb: Tuple[int, int, int]) -> np.ndarray:
+    pixel = np.array([[[rgb[0], rgb[1], rgb[2]]]], dtype=np.uint8)
+    return cv2.cvtColor(pixel, cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
 
 
-def estimate_grid(image: np.ndarray, rows: Optional[int], cols: Optional[int]):
+def load_color_mapping_data() -> Tuple[List[Dict], str]:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate_paths = [
+        os.path.join(current_dir, "colorSystemMapping.json"),
+        os.path.join(current_dir, "..", "utils", "colorSystemMapping.json"),
+        os.path.join(current_dir, "..", "utils", "colorSystemMapping.js"),
+    ]
+
+    loaded_data = None
+    loaded_path = ""
+    for path in candidate_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            if path.endswith(".json"):
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded_data = json.load(f)
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                content = content.replace("module.exports =", "", 1).strip()
+                if content.endswith(";"):
+                    content = content[:-1]
+                loaded_data = json.loads(content)
+            loaded_path = path
+            break
+        except Exception:
+            continue
+
+    palette = []
+    if isinstance(loaded_data, dict):
+        for hex_key, codes in loaded_data.items():
+            rgb = hex_to_rgb(hex_key)
+            if rgb is None:
+                continue
+            safe_codes = codes if isinstance(codes, dict) else {}
+            palette.append(
+                {
+                    "hex": rgb_to_hex(rgb),
+                    "rgb": np.array(rgb, dtype=np.float32),
+                    "lab": rgb_to_lab(rgb),
+                    "codes": safe_codes,
+                }
+            )
+
+    if not palette:
+        fallback = [
+            ("#000000", {"MARD": "H07"}),
+            ("#FFFFFF", {"MARD": "T01"}),
+            ("#FFD67D", {"MARD": "A25"}),
+            ("#F4D738", {"MARD": "A05"}),
+            ("#FEC0DF", {"MARD": "E02"}),
+        ]
+        for hex_color, codes in fallback:
+            rgb = hex_to_rgb(hex_color)
+            if rgb is None:
+                continue
+            palette.append(
+                {
+                    "hex": hex_color,
+                    "rgb": np.array(rgb, dtype=np.float32),
+                    "lab": rgb_to_lab(rgb),
+                    "codes": codes,
+                }
+            )
+        loaded_path = "fallback"
+
+    return palette, loaded_path
+
+
+COLOR_DB, COLOR_DB_SOURCE = load_color_mapping_data()
+
+
+def order_quad_points(quad: np.ndarray) -> np.ndarray:
+    pts = quad.astype(np.float32).reshape(4, 2)
+    sums = pts.sum(axis=1)
+    diffs = np.diff(pts, axis=1).reshape(-1)
+    top_left = pts[np.argmin(sums)]
+    bottom_right = pts[np.argmax(sums)]
+    top_right = pts[np.argmin(diffs)]
+    bottom_left = pts[np.argmax(diffs)]
+    return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
+
+
+def detect_perspective_quad(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    edge_x = np.abs(sobel_x)
-    edge_y = np.abs(sobel_y)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1)
 
-    profile_x = np.sum(edge_x, axis=0)
-    profile_y = np.sum(edge_y, axis=1)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    img_area = float(image.shape[0] * image.shape[1])
+    min_area = img_area * 0.20
+    best = None
+    best_area = 0.0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if len(approx) != 4 or not cv2.isContourConvex(approx):
+            continue
+        if area > best_area:
+            best = approx
+            best_area = area
+
+    return best
+
+
+def perspective_correct_if_needed(image: np.ndarray, enabled: bool) -> Tuple[np.ndarray, Dict]:
+    if not enabled:
+        return image, {"applied": False, "reason": "disabled"}
+
+    quad = detect_perspective_quad(image)
+    if quad is None:
+        return image, {"applied": False, "reason": "no_quad"}
+
+    ordered = order_quad_points(quad)
+    width_a = np.linalg.norm(ordered[2] - ordered[3])
+    width_b = np.linalg.norm(ordered[1] - ordered[0])
+    height_a = np.linalg.norm(ordered[1] - ordered[2])
+    height_b = np.linalg.norm(ordered[0] - ordered[3])
+    target_w = int(round(max(width_a, width_b)))
+    target_h = int(round(max(height_a, height_b)))
+
+    if target_w < 50 or target_h < 50:
+        return image, {"applied": False, "reason": "small_target"}
+
+    dst = np.array(
+        [[0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(ordered, dst)
+    warped = cv2.warpPerspective(image, matrix, (target_w, target_h))
+    return warped, {"applied": True, "targetWidth": target_w, "targetHeight": target_h}
+
+
+def build_grid_line_mask(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    binary = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7
+    )
 
     h, w = gray.shape[:2]
-    origin_x, cell_w, final_cols = estimate_axis(w, profile_x, cols)
-    origin_y, cell_h, final_rows = estimate_axis(h, profile_y, rows)
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(3, w // 70), 1)
+    )
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (1, max(3, h // 70))
+    )
+    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+    grid = cv2.bitwise_or(horizontal, vertical)
+    grid = cv2.dilate(grid, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    return grid
+
+
+def compute_grid_bbox(grid_mask: np.ndarray) -> Tuple[int, int, int, int]:
+    h, w = grid_mask.shape[:2]
+    non_zero = cv2.findNonZero(grid_mask)
+    if non_zero is None:
+        return 0, 0, w, h
+
+    x, y, bw, bh = cv2.boundingRect(non_zero)
+    if bw * bh < 0.20 * w * h:
+        return 0, 0, w, h
+
+    pad = int(round(min(bw, bh) * 0.01))
+    x = max(0, x - pad)
+    y = max(0, y - pad)
+    bw = min(w - x, bw + pad * 2)
+    bh = min(h - y, bh + pad * 2)
+    return x, y, bw, bh
+
+
+def collect_line_centers(profile: np.ndarray, threshold: float) -> List[int]:
+    active = np.where(profile >= threshold)[0]
+    if active.size == 0:
+        return []
+
+    centers = []
+    start = int(active[0])
+    prev = int(active[0])
+    for idx in active[1:]:
+        idx = int(idx)
+        if idx == prev + 1:
+            prev = idx
+            continue
+        centers.append(int(round((start + prev) / 2.0)))
+        start = idx
+        prev = idx
+    centers.append(int(round((start + prev) / 2.0)))
+    return centers
+
+
+def robust_spacing(centers: List[int]) -> Optional[float]:
+    if len(centers) < 2:
+        return None
+    diffs = [centers[i] - centers[i - 1] for i in range(1, len(centers))]
+    diffs = [d for d in diffs if d > 2]
+    if not diffs:
+        return None
+    return float(np.median(diffs))
+
+
+def detect_axis_geometry(
+    grid_mask: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    axis: str,
+    expected_count: Optional[int],
+) -> Tuple[float, float, int]:
+    x, y, w, h = bbox
+    roi = grid_mask[y : y + h, x : x + w]
+
+    if axis == "x":
+        profile = np.sum((roi > 0).astype(np.float32), axis=0)
+        axis_len = w
+        axis_offset = x
+    else:
+        profile = np.sum((roi > 0).astype(np.float32), axis=1)
+        axis_len = h
+        axis_offset = y
+
+    profile_max = float(np.max(profile)) if profile.size > 0 else 0.0
+    centers_local = []
+    if profile_max > 0:
+        high_threshold = max(2.0, profile_max * 0.35)
+        centers_local = collect_line_centers(profile, high_threshold)
+        if len(centers_local) < 3:
+            low_threshold = max(1.0, profile_max * 0.20)
+            centers_local = collect_line_centers(profile, low_threshold)
+
+    centers = [axis_offset + c for c in centers_local]
+
+    if expected_count and expected_count > 0:
+        if len(centers) >= 2:
+            start = float(centers[0])
+            end = float(centers[-1])
+            if end <= start:
+                start = float(axis_offset)
+                end = float(axis_offset + axis_len)
+        else:
+            start = float(axis_offset)
+            end = float(axis_offset + axis_len)
+        spacing = max(1.0, (end - start) / float(expected_count))
+        return start, spacing, int(expected_count)
+
+    spacing = robust_spacing(centers)
+    if spacing and spacing > 0 and len(centers) >= 2:
+        start = float(centers[0])
+        end = float(centers[-1])
+        count = max(1, int(round((end - start) / spacing)))
+        count = min(300, max(1, count))
+        if count >= 1:
+            spacing = max(1.0, (end - start) / float(count))
+            return start, spacing, count
+
+    fallback_count = max(20, min(80, int(round(axis_len / 24.0))))
+    fallback_spacing = max(1.0, axis_len / float(fallback_count))
+    return float(axis_offset), float(fallback_spacing), int(fallback_count)
+
+
+def detect_grid_geometry(
+    image: np.ndarray, expected_rows: Optional[int], expected_cols: Optional[int]
+) -> Dict:
+    grid_mask = build_grid_line_mask(image)
+    bbox = compute_grid_bbox(grid_mask)
+    origin_x, cell_w, cols = detect_axis_geometry(grid_mask, bbox, "x", expected_cols)
+    origin_y, cell_h, rows = detect_axis_geometry(grid_mask, bbox, "y", expected_rows)
+
+    rows = min(300, max(1, rows))
+    cols = min(300, max(1, cols))
+    cell_w = max(1.0, float(cell_w))
+    cell_h = max(1.0, float(cell_h))
 
     return {
         "origin_x": float(origin_x),
         "origin_y": float(origin_y),
-        "cell_w": float(cell_w),
-        "cell_h": float(cell_h),
-        "rows": int(final_rows),
-        "cols": int(final_cols),
+        "cell_w": cell_w,
+        "cell_h": cell_h,
+        "rows": int(rows),
+        "cols": int(cols),
+        "bbox": {
+            "x": int(bbox[0]),
+            "y": int(bbox[1]),
+            "width": int(bbox[2]),
+            "height": int(bbox[3]),
+        },
     }
 
 
-def normalize_text(text: str) -> str:
-    if not text:
-        return ""
-    up = text.upper()
-    tokens = ALNUM_PATTERN.findall(up)
-    if not tokens:
-        return ""
-    merged = "".join(tokens)
-    return merged
+def extract_cell_average_colors(image: np.ndarray, grid: Dict) -> List[Dict]:
+    h, w = image.shape[:2]
+    rows = int(grid["rows"])
+    cols = int(grid["cols"])
+    origin_x = float(grid["origin_x"])
+    origin_y = float(grid["origin_y"])
+    cell_w = float(grid["cell_w"])
+    cell_h = float(grid["cell_h"])
+
+    samples = []
+    for row in range(rows):
+        for col in range(cols):
+            x0 = int(round(origin_x + col * cell_w))
+            y0 = int(round(origin_y + row * cell_h))
+            x1 = int(round(origin_x + (col + 1) * cell_w))
+            y1 = int(round(origin_y + (row + 1) * cell_h))
+            x0 = max(0, min(w - 1, x0))
+            y0 = max(0, min(h - 1, y0))
+            x1 = max(x0 + 1, min(w, x1))
+            y1 = max(y0 + 1, min(h, y1))
+
+            cell_region = image[y0:y1, x0:x1]
+            if cell_region.size == 0:
+                avg_rgb = [255, 255, 255]
+            else:
+                pad_x = int(max(1, (x1 - x0) * 0.16))
+                pad_y = int(max(1, (y1 - y0) * 0.16))
+                sx0 = min(x1 - 1, x0 + pad_x)
+                sx1 = max(sx0 + 1, x1 - pad_x)
+                sy0 = min(y1 - 1, y0 + pad_y)
+                sy1 = max(sy0 + 1, y1 - pad_y)
+                sample_region = image[sy0:sy1, sx0:sx1]
+                if sample_region.size == 0:
+                    sample_region = cell_region
+                avg_bgr = sample_region.reshape(-1, 3).mean(axis=0)
+                avg_rgb = [
+                    int(round(avg_bgr[2])),
+                    int(round(avg_bgr[1])),
+                    int(round(avg_bgr[0])),
+                ]
+
+            samples.append(
+                {
+                    "row": row + 1,
+                    "col": col + 1,
+                    "avgColor": avg_rgb,
+                }
+            )
+    return samples
 
 
-def to_cell_index(center: float, origin: float, cell_size: float) -> int:
-    if cell_size <= 0:
-        return -1
-    return int(np.floor((center - origin) / cell_size))
+def estimate_cluster_count(avg_colors: np.ndarray, requested_count: Optional[int]) -> int:
+    n = int(avg_colors.shape[0])
+    if n <= 0:
+        return 1
+    if requested_count and requested_count > 0:
+        return max(1, min(int(requested_count), n, 64))
+    if n <= 4:
+        return n
+
+    quantized = (avg_colors // 24).astype(np.int32)
+    _, counts = np.unique(quantized, axis=0, return_counts=True)
+    min_bucket = max(2, int(round(n * 0.01)))
+    significant = int(np.sum(counts >= min_bucket))
+
+    if significant < 2:
+        significant = min(len(counts), max(3, int(round(np.sqrt(n) / 2.0))))
+
+    return max(1, min(significant, n, 48))
 
 
-def run_full_image_ocr(image: np.ndarray):
-    """Run OCR on the full image with error handling and preprocessing"""
-    try:
-        # Preprocess image to improve OCR accuracy
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Apply slight sharpening to improve text clarity
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        gray = cv2.filter2D(gray, -1, kernel)
-        
-        # Convert back to BGR for PaddleOCR
-        processed_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        
-        # PaddleOCR accepts numpy BGR image directly.
-        result = OCR_ENGINE.ocr(processed_image, cls=False)
-        lines = result[0] if result and len(result) > 0 else []
-        print(f"[DEBUG] OCR completed successfully, found {len(lines) if lines else 0} text regions")
-        return lines
-    except Exception as e:
-        print(f"[ERROR] OCR failed with error: {e}")
-        import traceback
-        traceback.print_exc()
-        # Return empty list instead of raising exception
-        return []
+def run_color_kmeans(avg_colors: np.ndarray, cluster_count: int) -> Tuple[np.ndarray, np.ndarray]:
+    n = int(avg_colors.shape[0])
+    if n == 0:
+        return np.zeros((0,), dtype=np.int32), np.zeros((0, 3), dtype=np.float32)
+    if cluster_count <= 1 or n == 1:
+        center = np.mean(avg_colors, axis=0, keepdims=True).astype(np.float32)
+        labels = np.zeros((n,), dtype=np.int32)
+        return labels, center
+
+    data = np.float32(avg_colors)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.5)
+    _, labels, centers = cv2.kmeans(
+        data,
+        cluster_count,
+        None,
+        criteria,
+        5,
+        cv2.KMEANS_PP_CENTERS,
+    )
+    return labels.reshape(-1).astype(np.int32), centers.astype(np.float32)
 
 
-def map_ocr_to_grid(lines, grid_info):
-    rows = grid_info["rows"]
-    cols = grid_info["cols"]
-    origin_x = grid_info["origin_x"]
-    origin_y = grid_info["origin_y"]
-    cell_w = grid_info["cell_w"]
-    cell_h = grid_info["cell_h"]
+def find_nearest_palette_color(rgb: np.ndarray, color_system: str) -> Dict:
+    rgb_tuple = (
+        int(round(rgb[0])),
+        int(round(rgb[1])),
+        int(round(rgb[2])),
+    )
+    target_lab = rgb_to_lab(rgb_tuple)
 
-    cells: Dict[Tuple[int, int], Dict] = {}
+    best = None
+    best_distance = float("inf")
+    for entry in COLOR_DB:
+        distance = float(np.linalg.norm(target_lab - entry["lab"]))
+        if distance < best_distance:
+            best_distance = distance
+            best = entry
 
-    for item in lines:
-        if not item or len(item) < 2:
-            continue
-        box = item[0]
-        text_info = item[1]
-        if not text_info or len(text_info) < 2:
-            continue
+    if not best:
+        return {
+            "hex": rgb_to_hex(rgb_tuple),
+            "code": rgb_to_hex(rgb_tuple),
+            "paletteDistance": 0.0,
+        }
 
-        text_raw = str(text_info[0] or "")
-        conf = float(text_info[1] or 0.0)
-        
-        # 降低置信度阈值，保留更多候选
-        if conf < 0.3:
-            continue
-        
-        text = normalize_text(text_raw)
-        if not text:
-            continue
-        
-        # 使用更宽松的匹配策略
-        is_valid_code = False
-        if MARD_PATTERN.match(text):
-            is_valid_code = True
-        elif COLOR_CODE_PATTERN.match(text):
-            is_valid_code = True
-        elif len(text) >= 2 and any(c.isalpha() for c in text) and any(c.isdigit() for c in text):
-            # 至少包含字母和数字的组合
-            is_valid_code = True
-        
-        if not is_valid_code:
-            continue
+    code = (
+        best["codes"].get(color_system)
+        or best["codes"].get("MARD")
+        or best["hex"]
+    )
+    return {
+        "hex": best["hex"],
+        "code": str(code).strip().upper(),
+        "paletteDistance": round(best_distance, 4),
+    }
 
-        pts = np.array(box, dtype=np.float32)
-        cx = float(np.mean(pts[:, 0]))
-        cy = float(np.mean(pts[:, 1]))
-        col = to_cell_index(cx, origin_x, cell_w)
-        row = to_cell_index(cy, origin_y, cell_h)
 
-        if row < 0 or row >= rows or col < 0 or col >= cols:
-            continue
-
-        key = (row, col)
-        prev = cells.get(key)
-        # 选择置信度更高的结果
-        if prev is None or conf > prev["conf"]:
-            cells[key] = {
-                "row": row + 1,
-                "col": col + 1,
-                "text": text,
-                "conf": round(conf, 4),
+def build_parse_result(
+    cell_samples: List[Dict],
+    labels: np.ndarray,
+    centers: np.ndarray,
+    rows: int,
+    cols: int,
+    color_system: str,
+) -> Tuple[List[Dict], List[List[str]], List[Dict], List[Dict]]:
+    cluster_palette = []
+    for i in range(centers.shape[0]):
+        mapped = find_nearest_palette_color(centers[i], color_system)
+        cluster_palette.append(
+            {
+                "cluster": i,
+                "centerRgb": [
+                    int(round(centers[i][0])),
+                    int(round(centers[i][1])),
+                    int(round(centers[i][2])),
+                ],
+                "mappedHex": mapped["hex"],
+                "mappedCode": mapped["code"],
+                "paletteDistance": mapped["paletteDistance"],
             }
+        )
 
-    mapped = list(cells.values())
-    mapped.sort(key=lambda x: (x["row"], x["col"]))
-    return mapped
+    matrix = [["" for _ in range(cols)] for _ in range(rows)]
+    material_counter: Dict[str, Dict] = {}
+    cells = []
+
+    for idx, base_cell in enumerate(cell_samples):
+        cluster_id = int(labels[idx]) if idx < labels.shape[0] else 0
+        cluster_info = cluster_palette[cluster_id] if cluster_palette else None
+        code = cluster_info["mappedCode"] if cluster_info else "UNKNOWN"
+        mapped_hex = cluster_info["mappedHex"] if cluster_info else "#000000"
+        palette_distance = cluster_info["paletteDistance"] if cluster_info else 0.0
+        center_rgb = centers[cluster_id] if centers.shape[0] > 0 else np.array([0, 0, 0], dtype=np.float32)
+
+        avg_rgb = np.array(base_cell["avgColor"], dtype=np.float32)
+        dist_to_center = float(np.linalg.norm(avg_rgb - center_rgb))
+        confidence = 1.0 - min(1.0, (0.7 * dist_to_center + 0.3 * palette_distance) / 120.0)
+        confidence = float(max(0.0, min(1.0, confidence)))
+
+        row = int(base_cell["row"])
+        col = int(base_cell["col"])
+        matrix[row - 1][col - 1] = code
+
+        cells.append(
+            {
+                "row": row,
+                "col": col,
+                "text": code,
+                "code": code,
+                "conf": round(confidence, 4),
+                "avgColor": [int(v) for v in base_cell["avgColor"]],
+                "mappedHex": mapped_hex,
+                "cluster": cluster_id,
+            }
+        )
+
+        if code not in material_counter:
+            material_counter[code] = {"code": code, "hex": mapped_hex, "count": 0}
+        material_counter[code]["count"] += 1
+
+    material_stats = sorted(
+        material_counter.values(),
+        key=lambda item: (-item["count"], item["code"]),
+    )
+    return cells, matrix, material_stats, cluster_palette
 
 
 @app.route("/health", methods=["GET"])
@@ -334,7 +614,6 @@ def handle_count_request():
 
     action = str(body.get("action") or "parse_grid")
     if action == "inc":
-        # Keep compatibility with cloud console sample call.
         return jsonify(
             {
                 "success": True,
@@ -344,10 +623,11 @@ def handle_count_request():
             }
         )
 
-    rows = body.get("rows")
-    cols = body.get("cols")
-    rows = int(rows) if isinstance(rows, int) and rows > 0 else None
-    cols = int(cols) if isinstance(cols, int) and cols > 0 else None
+    rows = parse_positive_int(body.get("rows"))
+    cols = parse_positive_int(body.get("cols"))
+    color_count = parse_positive_int(body.get("colorCount") or body.get("clusterCount"))
+    color_system = str(body.get("colorSystem") or "MARD").strip() or "MARD"
+    enable_perspective = parse_bool(body.get("perspectiveCorrection"), True)
 
     image = None
     image_transport = str(body.get("imageTransport") or "")
@@ -365,23 +645,24 @@ def handle_count_request():
         return make_error(debug_id, f"load image failed: {exc}", 400)
 
     try:
-        h, w = image.shape[:2]
-        
-        print(f"[DEBUG] Starting grid detection for {w}x{h} image")
-        grid_info = estimate_grid(image, rows, cols)
-        
-        # Add debugging information
-        print(f"[DEBUG] Grid detected: {grid_info['rows']}x{grid_info['cols']}")
-        print(f"[DEBUG] Cell size: {grid_info['cell_w']:.2f}x{grid_info['cell_h']:.2f}")
-        print(f"[DEBUG] Origin: ({grid_info['origin_x']:.2f}, {grid_info['origin_y']:.2f})")
-        if rows or cols:
-            print(f"[DEBUG] User provided: rows={rows}, cols={cols}")
-        
-        ocr_lines = run_full_image_ocr(image)
-        print(f"[DEBUG] OCR detected {len(ocr_lines) if ocr_lines else 0} text regions")
-        
-        mapped_cells = map_ocr_to_grid(ocr_lines, grid_info)
-        print(f"[DEBUG] Mapped {len(mapped_cells)} cells with valid color codes")
+        source_h, source_w = image.shape[:2]
+        corrected_image, perspective_meta = perspective_correct_if_needed(image, enable_perspective)
+        parse_h, parse_w = corrected_image.shape[:2]
+
+        grid_info = detect_grid_geometry(corrected_image, rows, cols)
+        cell_samples = extract_cell_average_colors(corrected_image, grid_info)
+        avg_colors = np.array([cell["avgColor"] for cell in cell_samples], dtype=np.float32)
+        k = estimate_cluster_count(avg_colors, color_count)
+        labels, centers = run_color_kmeans(avg_colors, k)
+
+        cells, code_matrix, material_stats, cluster_palette = build_parse_result(
+            cell_samples=cell_samples,
+            labels=labels,
+            centers=centers,
+            rows=int(grid_info["rows"]),
+            cols=int(grid_info["cols"]),
+            color_system=color_system,
+        )
 
         elapsed_ms = int((time.time() - started) * 1000)
         return jsonify(
@@ -390,35 +671,45 @@ def handle_count_request():
                 "debugId": debug_id,
                 "action": action,
                 "imageTransport": image_transport,
+                "message": "ok",
+                "elapsedMs": elapsed_ms,
                 "image": {
-                    "width": int(w),
-                    "height": int(h),
+                    "width": int(source_w),
+                    "height": int(source_h),
+                    "parsedWidth": int(parse_w),
+                    "parsedHeight": int(parse_h),
                 },
+                "perspective": perspective_meta,
                 "grid": {
                     "rows": int(grid_info["rows"]),
                     "cols": int(grid_info["cols"]),
                     "origin": {
-                        "x": round(grid_info["origin_x"], 2),
-                        "y": round(grid_info["origin_y"], 2),
+                        "x": round(float(grid_info["origin_x"]), 2),
+                        "y": round(float(grid_info["origin_y"]), 2),
                     },
                     "cellSize": {
-                        "x": round(grid_info["cell_w"], 4),
-                        "y": round(grid_info["cell_h"], 4),
+                        "x": round(float(grid_info["cell_w"]), 4),
+                        "y": round(float(grid_info["cell_h"]), 4),
                     },
+                    "bbox": grid_info["bbox"],
                 },
                 "rows": int(grid_info["rows"]),
                 "cols": int(grid_info["cols"]),
-                "cells": mapped_cells,
-                "message": "ok",
-                "elapsedMs": elapsed_ms,
+                "clusterCount": int(k),
+                "colorSystem": color_system,
+                "paletteSource": COLOR_DB_SOURCE,
+                "clusters": cluster_palette,
+                "cells": cells,
+                "codeMatrix": code_matrix,
+                "materialStats": material_stats,
             }
         )
     except Exception as exc:
         import traceback
-        error_detail = traceback.format_exc()
-        print(f"[ERROR] OCR processing failed:")
-        print(error_detail)
-        return make_error(debug_id, f"ocr failed: {str(exc)}", 500)
+
+        print("[ERROR] parse pipeline failed")
+        print(traceback.format_exc())
+        return make_error(debug_id, f"parse failed: {str(exc)}", 500)
 
 
 @app.route("/", methods=["GET"])
@@ -427,6 +718,15 @@ def root():
         {
             "ok": True,
             "service": "cloud_ocr_service",
+            "pipeline": [
+                "read-image",
+                "perspective-correction",
+                "detect-grid",
+                "extract-cell-avg-color",
+                "kmeans-cluster",
+                "map-standard-color-db",
+                "output-matrix-and-materials",
+            ],
             "routes": [
                 "/api/count",
                 "/count",
