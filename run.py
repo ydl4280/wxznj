@@ -17,6 +17,10 @@ app = Flask(__name__)
 MAX_IMAGE_EDGE = 2200
 VALID_CODE_RE = re.compile(r"^[A-Z]{1,3}[0-9]{1,4}[A-Z]?$")
 ALNUM_RE = re.compile(r"[A-Z0-9]+")
+OCR_MIN_CONFIDENCE = 0.10
+OCR_FALLBACK_RATIO_THRESHOLD = 0.15
+OCR_TILE_SIZE = 920
+OCR_TILE_OVERLAP = 0.16
 
 OCR_ENGINE = PaddleOCR(
     use_angle_cls=False,
@@ -316,13 +320,159 @@ def preprocess_for_ocr(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
 
 
-def run_full_image_ocr(image: np.ndarray):
-    processed = preprocess_for_ocr(image)
+def preprocess_variants_for_ocr(image: np.ndarray) -> List[np.ndarray]:
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    adaptive_inv = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7
+    )
+
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, w // 70), 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, h // 70)))
+    horizontal = cv2.morphologyEx(adaptive_inv, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    vertical = cv2.morphologyEx(adaptive_inv, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+    grid_lines = cv2.bitwise_or(horizontal, vertical)
+
+    no_grid = gray.copy()
+    no_grid[grid_lines > 0] = 255
+    binary = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 9
+    )
+
+    return [
+        image,
+        preprocess_for_ocr(image),
+        cv2.cvtColor(no_grid, cv2.COLOR_GRAY2BGR),
+        cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR),
+    ]
+
+
+def run_ocr_once(image: np.ndarray):
     try:
-        result = OCR_ENGINE.ocr(processed, cls=False)
+        result = OCR_ENGINE.ocr(image, cls=False)
         return result[0] if result and len(result) > 0 and result[0] else []
     except Exception:
         return []
+
+
+def upscale_for_ocr(image: np.ndarray, min_short_edge: int = 1400, max_scale: float = 2.4) -> Tuple[np.ndarray, float]:
+    h, w = image.shape[:2]
+    short_edge = min(h, w)
+    if short_edge <= 0:
+        return image, 1.0
+    if short_edge >= min_short_edge:
+        return image, 1.0
+    scale = min(max_scale, float(min_short_edge) / float(short_edge))
+    target_w = max(1, int(round(w * scale)))
+    target_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+    return resized, scale
+
+
+def shift_lines(lines, dx: float, dy: float):
+    shifted = []
+    for item in lines:
+        if not item or len(item) < 2:
+            continue
+        box = item[0]
+        info = item[1]
+        if not box:
+            continue
+        new_box = []
+        for pt in box:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                continue
+            new_box.append([float(pt[0]) + dx, float(pt[1]) + dy])
+        if len(new_box) >= 4:
+            shifted.append([new_box, info])
+    return shifted
+
+
+def scale_lines(lines, scale: float):
+    if scale <= 0:
+        return lines
+    if abs(scale - 1.0) < 1e-6:
+        return lines
+    inv = 1.0 / scale
+    scaled = []
+    for item in lines:
+        if not item or len(item) < 2:
+            continue
+        box = item[0]
+        info = item[1]
+        if not box:
+            continue
+        new_box = []
+        for pt in box:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                continue
+            new_box.append([float(pt[0]) * inv, float(pt[1]) * inv])
+        if len(new_box) >= 4:
+            scaled.append([new_box, info])
+    return scaled
+
+
+def iter_tiles(image: np.ndarray, tile_size: int = OCR_TILE_SIZE, overlap: float = OCR_TILE_OVERLAP):
+    h, w = image.shape[:2]
+    if h <= tile_size and w <= tile_size:
+        yield (0, 0, w, h)
+        return
+
+    step = max(64, int(round(tile_size * (1.0 - overlap))))
+    y = 0
+    while y < h:
+        x = 0
+        y_end = min(h, y + tile_size)
+        y_start = max(0, y_end - tile_size)
+        while x < w:
+            x_end = min(w, x + tile_size)
+            x_start = max(0, x_end - tile_size)
+            yield (x_start, y_start, x_end, y_end)
+            if x_end >= w:
+                break
+            x += step
+        if y_end >= h:
+            break
+        y += step
+
+
+def run_full_image_ocr(image: np.ndarray):
+    processed = preprocess_for_ocr(image)
+    return run_ocr_once(processed)
+
+
+def run_enhanced_ocr(image: np.ndarray) -> Tuple[List, Dict]:
+    lines_all = []
+    diagnostics = {
+        "passes": 0,
+        "tileRuns": 0,
+        "rawLines": 0,
+        "upscale": 1.0,
+    }
+
+    upscaled, scale = upscale_for_ocr(image)
+    diagnostics["upscale"] = round(float(scale), 3)
+    variants = preprocess_variants_for_ocr(upscaled)
+
+    for variant in variants:
+        diagnostics["passes"] += 1
+        full_lines = run_ocr_once(variant)
+        diagnostics["rawLines"] += len(full_lines)
+        lines_all.extend(full_lines)
+
+    # 分块 OCR：用于小字和复杂背景的补漏
+    for x0, y0, x1, y1 in iter_tiles(upscaled):
+        tile = upscaled[y0:y1, x0:x1]
+        for tile_variant in preprocess_variants_for_ocr(tile)[:3]:
+            tile_lines = run_ocr_once(tile_variant)
+            diagnostics["tileRuns"] += 1
+            diagnostics["rawLines"] += len(tile_lines)
+            lines_all.extend(shift_lines(tile_lines, x0, y0))
+
+    lines_all = scale_lines(lines_all, scale)
+    diagnostics["finalLines"] = len(lines_all)
+    return lines_all, diagnostics
 
 
 def to_cell_index(center: float, origin: float, cell_size: float) -> int:
@@ -370,7 +520,7 @@ def map_ocr_lines_to_grid(lines, grid: Dict, image: np.ndarray) -> List[Dict]:
             continue
         raw_text = str(text_info[0] or "")
         conf = float(text_info[1] or 0.0)
-        if conf < 0.20:
+        if conf < OCR_MIN_CONFIDENCE:
             continue
         code = normalize_ocr_text(raw_text)
         if not code:
@@ -474,8 +624,38 @@ def handle_count_request():
         corrected_image, perspective_meta = perspective_correct_if_needed(image, enable_perspective)
         parse_h, parse_w = corrected_image.shape[:2]
         grid = detect_grid_geometry(corrected_image, rows, cols)
-        ocr_lines = run_full_image_ocr(corrected_image)
-        cells = map_ocr_lines_to_grid(ocr_lines, grid, corrected_image)
+
+        estimated_cells = int(grid["rows"]) * int(grid["cols"])
+        ocr_lines_basic = run_full_image_ocr(corrected_image)
+        basic_cells = map_ocr_lines_to_grid(ocr_lines_basic, grid, corrected_image)
+        basic_ratio = (len(basic_cells) / float(estimated_cells)) if estimated_cells > 0 else 0.0
+
+        ocr_diagnostics = {
+            "mode": "basic",
+            "fallbackApplied": False,
+            "lineCountBasic": len(ocr_lines_basic),
+            "cellCountBasic": len(basic_cells),
+            "ratioBasic": round(float(basic_ratio), 4),
+        }
+
+        cells = basic_cells
+        if basic_ratio < OCR_FALLBACK_RATIO_THRESHOLD:
+            enhanced_lines, enhanced_diag = run_enhanced_ocr(corrected_image)
+            enhanced_cells = map_ocr_lines_to_grid(enhanced_lines, grid, corrected_image)
+            enhanced_ratio = (len(enhanced_cells) / float(estimated_cells)) if estimated_cells > 0 else 0.0
+            ocr_diagnostics.update(
+                {
+                    "lineCountEnhanced": len(enhanced_lines),
+                    "cellCountEnhanced": len(enhanced_cells),
+                    "ratioEnhanced": round(float(enhanced_ratio), 4),
+                    "enhancedDetails": enhanced_diag,
+                }
+            )
+            if len(enhanced_cells) > len(basic_cells):
+                cells = enhanced_cells
+                ocr_diagnostics["mode"] = "enhanced"
+                ocr_diagnostics["fallbackApplied"] = True
+
         code_matrix = build_code_matrix(int(grid["rows"]), int(grid["cols"]), cells)
         material_stats = build_material_stats(cells)
 
@@ -513,6 +693,7 @@ def handle_count_request():
                 "cells": cells,
                 "codeMatrix": code_matrix,
                 "materialStats": material_stats,
+                "ocrDiagnostics": ocr_diagnostics,
             }
         )
     except Exception as exc:
@@ -533,7 +714,8 @@ def root():
                 "read-image",
                 "perspective-correction",
                 "detect-grid",
-                "ocr-grid-codes",
+                "ocr-grid-codes-basic",
+                "ocr-grid-codes-enhanced-fallback",
                 "map-text-to-cells",
                 "output-code-matrix-and-materials",
             ],
